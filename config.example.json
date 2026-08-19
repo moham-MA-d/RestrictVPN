@@ -1,0 +1,33 @@
+{
+  "_comment": "Reference copy of config.json. You do not need this file: RestrictVPN writes its own config.json next to the exe on first run, filling in the adapters and VPN client programs it finds on your machine. This is here to document the schema and show what a filled-in config looks like. Values below are examples - your adapter names and paths will differ.",
+
+  "TunnelInterfaceAliases": [
+    "Local Area Connection",
+    "OpenVPN Connect DCO Adapter"
+  ],
+  "ExtraAllowedInterfaceAliases": [],
+
+  "VpnClientPrograms": [
+    "C:\Program Files\OpenVPN Connect\agent_ovpnconnect.exe",
+    "C:\Program Files\OpenVPN Connect\OpenVPNConnect.exe",
+    "C:\Program Files\OpenVPN Connect\ovpn_system_service.exe",
+    "C:\Program Files\OpenVPN Connect\ovpnconnector.exe",
+    "C:\Program Files\OpenVPN Connect\ovpnhelper_service.exe"
+  ],
+  "VpnServerEndpoints": [],
+  "AllowedPrograms": [],
+
+  "SplitTunnelEnabled": false,
+  "SplitTunnelAddresses": [],
+  "SplitTunnelPrograms": [],
+  "SplitTunnelUnderlayAlias": "",
+
+  "BypassProxyEnabled": false,
+  "BypassProxyPort": 1080,
+
+  "AllowLan": false,
+  "AllowDhcp": true,
+  "AllowVpnClientDns": true,
+  "BlockInbound": true,
+  "ArmAtBoot": false
+}

@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------------------
+# AI assistant / editor tooling — local only, never published
+# ---------------------------------------------------------------------------
+.claude/
+.claude.json
+.claude.json.backup
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json
+.cursor/
+.cursorrules
+.aider*
+.github/copilot-instructions.md
+
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+# The exe is built by build.cmd in one command and published via GitHub
+# Releases. Keeping binaries out of the repo also keeps a security tool
+# auditable: what you read here is all there is.
+*.exe
+*.pdb
+*.dll
+bin/
+obj/
+
+# ---------------------------------------------------------------------------
+# Runtime files, generated on first run — machine-specific, keep them local
+# ---------------------------------------------------------------------------
+# config.json holds your own adapter names and program paths. See
+# config.example.json for the schema; the app regenerates it on first run.
+config.json
+state/
+logs/
+selftest-result.txt
+
+# ---------------------------------------------------------------------------
+# Windows / editors
+# ---------------------------------------------------------------------------
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+.vs/
+.vscode/
+*.user
+*.suo
+*~
+*.swp
