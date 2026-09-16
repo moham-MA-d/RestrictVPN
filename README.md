@@ -24,7 +24,10 @@ by the C# compiler that already ships with Windows.
    shows one window with a big Arm / Disarm button.
 4. Press **Self test (changes nothing)** first. It rehearses the whole
    mechanism without touching your firewall.
-5. Tick your VPN's tunnel adapter in the list, then **ARM KILL SWITCH**.
+5. Choose how your VPN reaches the internet. If it has a tunnel adapter, tick it
+   in the list. If it is a local proxy — V2rayN, Clash, sing-box with TUN mode
+   off — choose **It is a local proxy** and press **Detect client**.
+6. Press **ARM KILL SWITCH**.
 
 If anything goes wrong, `Recover.cmd` forces your internet back on without
 loading the app at all. See [If you get locked out](#if-you-get-locked-out).
@@ -34,9 +37,12 @@ loading the app at all. See [If you get locked out](#if-you-get-locked-out).
 - Windows 10 or 11 (also works on Windows Server 2016+).
 - Administrator rights.
 - Windows Firewall enabled — this app configures it rather than replacing it.
-- Any VPN that presents a tunnel adapter. OpenVPN and OpenVPN Connect are what
-  it was built and tested against; WireGuard, Outline and commercial clients
-  work the same way as long as you tick the right adapter.
+- Any VPN, in one of two shapes:
+  - **It presents a tunnel adapter** — OpenVPN and OpenVPN Connect are what it
+    was built and tested against; WireGuard, Outline and commercial clients work
+    the same way as long as you tick the right adapter.
+  - **It is a local proxy with no adapter** — V2rayN, Clash, sing-box and
+    similar, whenever TUN mode is off. See [Proxy mode](#proxy-mode).
 
 ---
 
@@ -78,7 +84,9 @@ opposite of what a split tunnel asks for. The two cannot both be on. See
 | **Split tunnel...** | The one place for everything you want kept *off* the VPN: addresses, apps, and the bypass proxy that makes app entries work. |
 | **Emergency recover** | Forces internet back on, deletes every rule this app made, and removes its routes. |
 | **Arm at Windows startup** | Registers a boot task so you're never exposed before the VPN connects. |
-| **Tunnel adapter list** | Tick every adapter your VPN uses. A `*` marks the one currently carrying your internet traffic. |
+| **How your VPN reaches the internet** | Tunnel adapter, or local proxy. Not a preference — a fact about your VPN. See [Proxy mode](#proxy-mode). |
+| **Detect client** | Finds V2rayN (or Clash, or sing-box), reads its port and TUN setting out of its own config, and fills in the programs. |
+| **Tunnel adapter list** | Tick every adapter your VPN uses. A `*` marks the one currently carrying your internet traffic. In proxy mode this is only needed if the client runs in TUN mode. |
 
 The banner is colour-coded and refreshes every 2 seconds:
 
@@ -101,6 +109,10 @@ your firewall changes.
 ---
 
 ## How it works
+
+This describes **tunnel mode**, the default. A VPN that has no adapter of its
+own works the same way with a process-scoped allow-list instead — see
+[Proxy mode](#proxy-mode).
 
 When armed, RestrictVPN:
 
@@ -146,12 +158,209 @@ exactly as it was.
 
 ### How "VPN is up" is decided
 
+In **proxy mode** the question is whether the core is accepting on its loopback
+port, which is what an app would find if it tried right now. The rest of this
+applies to **tunnel mode**.
+
 Not by adapter status — an adapter can sit `Up` with a stale address long after
 the tunnel died, which is exactly the situation that leaks. Instead the app asks
 Windows which interface it would actually use to reach the public internet
 (`GetBestInterface`) and checks whether that's one of your tunnel adapters.
 Routing is unaffected by firewall rules, so this stays accurate even while the
 kill switch is blocking everything.
+
+---
+
+## Proxy mode
+
+Some VPN clients never create an adapter. **V2rayN, Clash, sing-box and Nekoray
+in their default configuration** run a core process that opens a SOCKS/HTTP
+listener on `127.0.0.1` and connect out from your ordinary NIC, using the same
+IP as everything else on the machine. There is no tunnel interface, so there is
+nothing to bind an interface-scoped rule to.
+
+Ticking your Wi-Fi adapter instead would "work" in the sense that the VPN keeps
+running — and would permit every other program on the machine at the same time,
+which is the opposite of a kill switch. So proxy mode changes what the allow
+rule is scoped to:
+
+| | Tunnel mode | Proxy mode |
+| --- | --- | --- |
+| Default outbound action | Block, all three profiles | Block, all three profiles |
+| The allow-list is | An **interface** — the tunnel adapter | A **process** — the VPN core |
+| Your apps get out because | Their packets leave via the tunnel | They hand bytes to the core over loopback |
+| When the VPN dies | The interface stops carrying packets, and the fallback path has no rule | The core stops accepting on its port, and the apps have no direct path either |
+| Result | No internet, no leak | No internet, no leak |
+
+The fail-closed property is identical, because it comes from the same place in
+both: `DefaultOutboundAction = Block` is the resting state, and the allow-list
+is narrow. Only the shape of the allow-list changes.
+
+### Why loopback needs no rule
+
+Windows does not apply firewall filtering to traffic that stays on `127.0.0.1`.
+That is what makes this work: with default-deny outbound in force, Chrome can
+still reach `127.0.0.1:10808`, the core still holds its one permitted
+connection to your server, and nothing else on the machine has a path out at
+all.
+
+### This is stricter than the client on its own
+
+A local-proxy client only diverts programs that *ask* to be proxied. Anything
+that ignores the system proxy setting — plenty of updaters, telemetry, and
+anything speaking a protocol the proxy setting does not cover — goes straight
+out your NIC with your real IP, **while the client sits there apparently
+connected**. That is not a failure mode, it is the normal behaviour, and it is
+invisible.
+
+Proxy mode closes exactly that gap. After arming, a program that ignores the
+proxy does not leak; it fails.
+
+### Setting it up
+
+1. Start your VPN client.
+2. Choose **It is a local proxy**, then press **Detect client**.
+
+   Detection leads with the running process rather than a list of install
+   paths, so a portable V2rayN on any drive is found without typing anything.
+   It reads the listen port and the TUN setting from the client's own
+   `guiConfigs\guiNConfig.json`, and picks up `v2rayN.exe` along with the cores
+   under `bin\` — `xray.exe`, `sing-box.exe`, `mihomo.exe`. Bundled helpers
+   that never touch the network are deliberately left out.
+3. Press **Self test**, which rehearses program scoping the same way the tunnel
+   self test rehearses interface scoping — a **disabled** probe rule, read back,
+   then deleted.
+4. **ARM KILL SWITCH**.
+
+Leave the adapter list empty unless the client is in TUN mode.
+
+### If your client is in TUN mode
+
+Then it *does* present an adapter, usually Wintun-based, and **Detect client**
+says so and leaves you in tunnel mode. Tick that adapter: scoping to the
+interface is stricter than scoping to the process, because it holds even if the
+core is compromised into making connections it should not.
+
+The core keeps its own allow rule either way — it has to reach your server over
+the physical NIC before there is a tunnel at all.
+
+### Apps that ignore the system proxy
+
+This is the one you will actually hit, and it is worth understanding rather than
+working around.
+
+Setting the Windows system proxy only redirects programs that *read* it.
+Browsers do — Edge, Chrome, Firefox all keep working after arming with nothing
+to configure. Plenty of other software does not: **VS Code, and most things
+built on Node, Electron, Go, Python or Java**, use their own HTTP stack and go
+straight out the NIC.
+
+Before arming, those programs were quietly reaching the internet **with your
+real IP while the VPN looked connected**. That is the leak this mode exists to
+close, so when one of them stops working after arming, it is not a bug — it is
+the first time you have been shown that it was never using the VPN.
+
+There are two ways to deal with it, and only one of them is right:
+
+| | What happens |
+| --- | --- |
+| **Point the app at the proxy** | Its traffic goes through the VPN like everything else. |
+| ~~Add it to `AllowedPrograms` or the split tunnel~~ | It gets a direct hole and carries your real IP — you have re-opened exactly the leak you just closed. |
+
+Reach for the second only for something that genuinely must be direct, such as
+an RDP client, which cannot speak a proxy at all.
+
+**VS Code**, as a worked example. In `settings.json`:
+
+```json
+"http.proxy": "http://127.0.0.1:10808",
+"terminal.integrated.env.windows": {
+    "HTTP_PROXY":  "http://127.0.0.1:10808",
+    "HTTPS_PROXY": "http://127.0.0.1:10808",
+    "NO_PROXY":    "localhost,127.0.0.1,::1"
+}
+```
+
+`http.proxy` covers the editor itself — extensions, the marketplace, updates.
+The terminal block is separate because child processes launched in the
+integrated terminal inherit the environment, not the setting, so `npm`, `pip`
+and `curl` need the variables. Reload the window afterwards.
+
+Git is a third case again: the built-in Source Control panel runs `git` with VS
+Code's own environment rather than the terminal's, so it needs git's own config:
+
+```
+git config --global http.proxy  http://127.0.0.1:10808
+git config --global https.proxy http://127.0.0.1:10808
+```
+
+To undo that later, `git config --global --unset http.proxy` (and `https.proxy`).
+
+**An editor extension that shells out to its own CLI** is a fourth case, and the
+one that catches people after they think they are finished. A VS Code extension
+does not run in the terminal, so `terminal.integrated.env.windows` never reaches
+it; it is spawned by the extension host and inherits *VS Code's* environment.
+Two ways to give it one:
+
+- the tool's own config, if it has one — Claude Code takes an `env` block in
+  `~/.claude/settings.json`, which applies immediately with no restart:
+
+  ```json
+  "env": {
+      "HTTP_PROXY":  "http://127.0.0.1:10808",
+      "HTTPS_PROXY": "http://127.0.0.1:10808",
+      "NO_PROXY":    "localhost,127.0.0.1,::1"
+  }
+  ```
+
+- or user-level environment variables, which every later process inherits:
+
+  ```powershell
+  [Environment]::SetEnvironmentVariable("HTTPS_PROXY", "http://127.0.0.1:10808", "User")
+  [Environment]::SetEnvironmentVariable("HTTP_PROXY",  "http://127.0.0.1:10808", "User")
+  [Environment]::SetEnvironmentVariable("NO_PROXY",    "localhost,127.0.0.1,::1", "User")
+  ```
+
+  **Fully quit and reopen VS Code** for these — *Developer: Reload Window* is not
+  enough, because the environment is inherited from the main process, which a
+  reload does not restart. To undo, set each to `$null`.
+
+So: app setting, terminal environment, tool-specific config, and the inherited
+process environment. Most software needs one of the four; something like VS Code
+plus an extension that spawns a CLI needs several.
+
+To check any of it, ask what address the far end sees, once each way:
+
+```
+curl -x http://127.0.0.1:10808 http://api.ipify.org   # should be your VPN exit
+curl --noproxy "*"             http://api.ipify.org   # your real IP
+```
+
+Two different answers means the proxy is doing something. If a program reports
+the second address, it is not using the VPN — and while armed it will simply
+stop instead.
+
+### What to know before arming
+
+- **DNS is blocked unless it goes through the proxy.** Anything resolving via
+  the system resolver is talking to your LAN's DNS server, which is now denied.
+  For proxy-aware apps this is a non-issue and an improvement — hostnames go to
+  the proxy and are resolved at the far end, so there is no plaintext lookup on
+  the wire. Tick **Allow the VPN client to resolve its server hostname** so the
+  core can still find your server, or pin `VpnServerEndpoints` to literal IPs
+  and drop even that.
+- **The banner reads the listener, not the far end.** "PROTECTED" means the
+  core is accepting connections on its port, which is what an app would find if
+  it tried right now. It does not prove your server is reachable — that would
+  need a real request pushed through on every poll. Protection does not rest on
+  this either way: it comes from the firewall policy, and the banner only
+  reports.
+- **An app in the split tunnel list is a full bypass here.** In tunnel mode an
+  app exclusion permits traffic without moving it, which is why it needs the
+  bypass proxy. In proxy mode nothing has taken the default route away from
+  your NIC — the proxy is a destination, not a path — so permitting an app is
+  all it takes for that app to go direct, with your real IP. The log says so
+  when it builds those rules.
 
 ---
 
@@ -335,6 +544,10 @@ In order, the things that actually go wrong:
 | `bypassProxy=False` while apps are listed | The proxy is off, so app entries are firewall permissions and nothing more. A warning line says so explicitly. |
 | `0 destination route(s)` with destinations configured | Look for the per-entry warning above it — an unresolvable hostname, or no gateway for that address family. |
 | `Bypass proxy: 127.0.0.1:1080 was refused ... reserved range 1041-1140` | Windows hands whole blocks of ports to WinNAT for Hyper-V and WSL, and a bind inside one fails with "access denied" however you are running. Nothing to do — a free port is picked automatically and saved to `config.json`. `netsh interface ipv4 show excludedportrange protocol=tcp` lists the blocks. |
+| Arming refuses with `No tunnel adapters are selected` | Your VPN has no adapter. Switch to [proxy mode](#proxy-mode) and press **Detect client**. |
+| Proxy mode armed, browsers work but VS Code / npm / a CLI tool does not | That program ignores the system proxy and was going direct — with your real IP — before you armed. Point it at the proxy; see [Apps that ignore the system proxy](#apps-that-ignore-the-system-proxy). |
+| Proxy mode armed and nothing has internet, including proxy-aware apps | The core is not running. The status line under the mode selector says whether anything is listening on the port. |
+| `Proxy mode: client allow rule exists: No client rule found` | None of the configured executables exist on disk — usually a client that moved or updated. Press **Detect client**. |
 | `Bypass proxy: could not reach ... AccessDenied` | A packet filter, never routing. Either the kill switch is armed without the bypass proxy's allow rule (press **Verify rules**, re-arm if it is missing), or OpenVPN Connect's **Seamless tunnel** is on and blocking everything outside the tunnel. |
 | The proxy is listening but there is no `connection 1` line | Nothing ever used it. The app was started after the fact, outside RestrictVPN, so it never knew the proxy existed. The split tunnel list will show it as `running ON the VPN`. |
 | An app shows `running ON the VPN` | Press **Save and apply** and accept the restart. A browser cannot be moved onto the bypass while it is running. |
@@ -405,8 +618,10 @@ rest. [`config.example.json`](config.example.json) documents the schema.
 
 | Key | Meaning |
 | --- | --- |
-| `TunnelInterfaceAliases` | The adapters traffic may leave through. Everything not listed is blocked. |
-| `VpnClientPrograms` | Executables allowed to reach the VPN server over the physical NIC. |
+| `Mode` | `tunnel` (default) or `proxy`. See [Proxy mode](#proxy-mode). A config written before this key existed reads as `tunnel`, which is what it was written against. |
+| `TunnelInterfaceAliases` | The adapters traffic may leave through. Everything not listed is blocked. Unused in proxy mode unless the client runs in TUN mode. |
+| `VpnClientPrograms` | Executables allowed to reach the VPN server over the physical NIC. In proxy mode this is the entire egress allow-list. |
+| `ProxyListenPort` | The loopback port the proxy client listens on, filled in by **Detect client**. Reporting only — Windows does not filter loopback, so nothing is opened for it. |
 | `VpnServerEndpoints` | Optional. Literal server IPs. Setting these tightens the client rule *and* removes the plaintext DNS exception. |
 | `AllowLan` | Local network access. Default `false`. |
 | `AllowDhcp` | Default `true`. Turning it off will likely break your Wi-Fi. |
@@ -435,6 +650,10 @@ rest. [`config.example.json`](config.example.json) documents the schema.
   covered by the same kill switch (correct and intended), or add
   `vEthernet (WSL (Hyper-V firewall))` to `ExtraAllowedInterfaceAliases` —
   understanding that this is a deliberate hole.
+- **V2rayN, Clash, sing-box.** Off by default these have no adapter at all, so
+  they need [proxy mode](#proxy-mode) rather than an entry in the adapter list.
+  Turn TUN mode on in the client and they behave like every other tunnel VPN
+  instead.
 - **Split tunnel needs a route more specific than the tunnel's.** OpenVPN
   typically holds `0.0.0.0/1` and `128.0.0.0/1`, so any exclusion you can
   express already is. A VPN that installs a true `0.0.0.0/0` default route works

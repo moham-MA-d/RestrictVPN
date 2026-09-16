@@ -13,11 +13,37 @@ namespace RestrictVpn
     /// </summary>
     internal class AppConfig
     {
+        /// <summary>
+        /// Which egress the allow-list is built around.
+        ///
+        ///   tunnel - the VPN presents an adapter, and that adapter is the only
+        ///            permitted way out. OpenVPN, WireGuard, and anything in TUN
+        ///            mode.
+        ///   proxy  - the VPN is a local proxy with no adapter of its own, so the
+        ///            core process is the only permitted way out and every other
+        ///            app reaches it over loopback. V2rayN, Clash, sing-box and
+        ///            friends, whenever TUN mode is off.
+        ///
+        /// The fail-closed guarantee is identical either way. Only the thing the
+        /// allow rule is scoped to changes: an interface, or an executable.
+        /// </summary>
+        public const string ModeTunnel = "tunnel";
+        public const string ModeProxy = "proxy";
+
+        public string Mode = ModeTunnel;
+
         public List<string> TunnelInterfaceAliases = new List<string>();
         public List<string> ExtraAllowedInterfaceAliases = new List<string>();
         public List<string> VpnClientPrograms = new List<string>();
         public List<string> VpnServerEndpoints = new List<string>();
         public List<string> AllowedPrograms = new List<string>();
+
+        /// <summary>
+        /// The loopback port the proxy client listens on. Used to report whether
+        /// the client is live, and to say so in the UI. Not a firewall setting:
+        /// Windows does not filter loopback, so nothing has to be opened for it.
+        /// </summary>
+        public int ProxyListenPort = ProxyClientService.DefaultListenPort;
 
         // Split tunnel: destinations and apps deliberately kept off the VPN.
         public List<string> SplitTunnelAddresses = new List<string>();
@@ -36,8 +62,10 @@ namespace RestrictVpn
         public bool ArmAtBoot = false;
 
         private const string Comment =
-            "RestrictVPN config. TunnelInterfaceAliases is the allow-list of adapters traffic " +
-            "may leave through. While the kill switch is on, every other outbound path is blocked. " +
+            "RestrictVPN config. Mode 'tunnel' means TunnelInterfaceAliases is the allow-list of adapters " +
+            "traffic may leave through; mode 'proxy' means VpnClientPrograms is the allow-list of processes " +
+            "traffic may leave through, for a client like V2rayN that has no adapter of its own. " +
+            "While the kill switch is on, every other outbound path is blocked. " +
             "SplitTunnelAddresses and SplitTunnelPrograms are the deliberate exceptions routed around the VPN.";
 
         private static readonly string[] VpnProgramSearchDirs = new string[]
@@ -82,7 +110,80 @@ namespace RestrictVpn
                 if (a.Status == "NotPresent") continue;
                 c.TunnelInterfaceAliases.Add(a.Alias);
             }
+
+            c.AdoptProxyClient(ProxyClientService.Detect(), false);
             return c;
+        }
+
+        /// <summary>
+        /// Folds a detected local-proxy client into this config: its executables
+        /// join the client allow-list and its loopback port is recorded.
+        ///
+        /// The mode only flips to proxy when the client is genuinely running
+        /// without an adapter - that is, TUN mode is off. With TUN mode on the
+        /// client does present an adapter, and interface scoping is both
+        /// available and stricter, so tunnel mode stays. Either way the core
+        /// process keeps its hole, because it has to reach the server over the
+        /// physical NIC before there is a tunnel to speak of.
+        ///
+        /// Returns true when anything changed.
+        /// </summary>
+        public bool AdoptProxyClient(ProxyClientInfo info, bool force)
+        {
+            if (info == null || info.Programs.Count == 0) return false;
+
+            bool changed = false;
+
+            foreach (string exe in info.Programs)
+            {
+                if (Contains(VpnClientPrograms, exe)) continue;
+                VpnClientPrograms.Add(exe);
+                changed = true;
+            }
+
+            if (info.ListenPort > 0 && ProxyListenPort != info.ListenPort)
+            {
+                ProxyListenPort = info.ListenPort;
+                changed = true;
+            }
+
+            bool wantProxy = !info.TunModeEnabled;
+            if (wantProxy && !IsProxyMode && (force || TunnelInterfaceAliases.Count == 0))
+            {
+                Mode = ModeProxy;
+                changed = true;
+            }
+
+            return changed;
+        }
+
+        public bool IsProxyMode
+        {
+            get { return string.Equals(Mode, ModeProxy, StringComparison.OrdinalIgnoreCase); }
+        }
+
+        /// <summary>
+        /// The executables that may reach the network directly while armed. In
+        /// proxy mode this is the entire egress allow-list, so a config that has
+        /// lost it would strand the machine rather than leak.
+        /// </summary>
+        public List<string> ExistingClientPrograms()
+        {
+            List<string> live = new List<string>();
+            foreach (string exe in VpnClientPrograms)
+            {
+                if (!string.IsNullOrEmpty(exe) && File.Exists(exe)) live.Add(exe);
+            }
+            return live;
+        }
+
+        private static bool Contains(List<string> list, string value)
+        {
+            foreach (string s in list)
+            {
+                if (string.Equals(s, value, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
         }
 
         // ----------------------------------------------------------- load/save
@@ -107,6 +208,8 @@ namespace RestrictVpn
                 if (map == null) throw new InvalidDataException("config.json is not a JSON object.");
 
                 AppConfig c = new AppConfig();
+                c.Mode = NormalizeMode(Text(map, "Mode"));
+                c.ProxyListenPort = Int(map, "ProxyListenPort", ProxyClientService.DefaultListenPort);
                 c.TunnelInterfaceAliases = Strings(map, "TunnelInterfaceAliases");
                 c.ExtraAllowedInterfaceAliases = Strings(map, "ExtraAllowedInterfaceAliases");
                 c.VpnClientPrograms = Strings(map, "VpnClientPrograms");
@@ -126,8 +229,13 @@ namespace RestrictVpn
 
                 // A config with no client programs is almost certainly stale
                 // rather than intentional, so re-discover instead of leaving the
-                // VPN unable to reconnect.
-                if (c.VpnClientPrograms.Count == 0) c.VpnClientPrograms = DiscoverVpnPrograms();
+                // VPN unable to reconnect. In proxy mode that list is the whole
+                // allow-list, so an empty one would strand the machine outright.
+                if (c.VpnClientPrograms.Count == 0)
+                {
+                    c.VpnClientPrograms = DiscoverVpnPrograms();
+                    c.AdoptProxyClient(ProxyClientService.Detect(), false);
+                }
 
                 return c;
             }
@@ -145,11 +253,13 @@ namespace RestrictVpn
             StringBuilder sb = new StringBuilder();
             sb.AppendLine("{");
             sb.AppendLine("  \"_comment\": " + Quote(Comment) + ",");
+            sb.AppendLine("  " + Quote("Mode") + ": " + Quote(NormalizeMode(Mode)) + ",");
             sb.AppendLine("  " + Quote("TunnelInterfaceAliases") + ": " + Array(TunnelInterfaceAliases) + ",");
             sb.AppendLine("  " + Quote("ExtraAllowedInterfaceAliases") + ": " + Array(ExtraAllowedInterfaceAliases) + ",");
             sb.AppendLine("  " + Quote("VpnClientPrograms") + ": " + Array(VpnClientPrograms) + ",");
             sb.AppendLine("  " + Quote("VpnServerEndpoints") + ": " + Array(VpnServerEndpoints) + ",");
             sb.AppendLine("  " + Quote("AllowedPrograms") + ": " + Array(AllowedPrograms) + ",");
+            sb.AppendLine("  " + Quote("ProxyListenPort") + ": " + ProxyListenPort + ",");
             sb.AppendLine("  " + Quote("SplitTunnelEnabled") + ": " + Bool(SplitTunnelEnabled) + ",");
             sb.AppendLine("  " + Quote("SplitTunnelAddresses") + ": " + Array(SplitTunnelAddresses) + ",");
             sb.AppendLine("  " + Quote("SplitTunnelPrograms") + ": " + Array(SplitTunnelPrograms) + ",");
@@ -182,6 +292,18 @@ namespace RestrictVpn
         }
 
         // -------------------------------------------------------------- helpers
+
+        /// <summary>
+        /// Anything unrecognised - including the empty string a config written
+        /// before this setting existed produces - reads as tunnel mode, which is
+        /// the behaviour those configs were written against.
+        /// </summary>
+        private static string NormalizeMode(string raw)
+        {
+            return string.Equals(raw, ModeProxy, StringComparison.OrdinalIgnoreCase)
+                ? ModeProxy
+                : ModeTunnel;
+        }
 
         private static List<string> Strings(Dictionary<string, object> map, string key)
         {

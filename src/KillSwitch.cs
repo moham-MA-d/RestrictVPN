@@ -35,7 +35,23 @@ namespace RestrictVpn
 
     /// <summary>
     /// Orchestrates the fail-closed policy: default-deny outbound on every
-    /// profile, with a narrow allow-list for the tunnel and the VPN client.
+    /// profile, with a narrow allow-list for the VPN.
+    ///
+    /// What that allow-list is scoped to depends on the shape of the VPN:
+    ///
+    ///   tunnel mode - the VPN owns an adapter, so one rule bound to that
+    ///                 adapter permits everything leaving through it. Traffic is
+    ///                 allowed because of the path it takes.
+    ///   proxy  mode - the VPN is a local proxy with no adapter, so the only
+    ///                 rules are for the core process itself. Traffic is allowed
+    ///                 because of the process that sends it, and every other app
+    ///                 reaches the network by handing bytes to that process over
+    ///                 loopback, which Windows Firewall does not filter.
+    ///
+    /// The failure behaviour is the same in both. In tunnel mode a dead tunnel
+    /// stops carrying packets and the fallback path has no allow rule. In proxy
+    /// mode a dead core stops accepting on its port and the apps that were using
+    /// it have no direct path either. Neither leaks; both simply stop.
     /// </summary>
     internal class KillSwitch
     {
@@ -70,34 +86,63 @@ namespace RestrictVpn
             s.Profiles = _fw.GetProfiles();
             s.RuleCount = enumerateRules ? _fw.GetRulesInGroup(RuleGroup).Count : cachedRuleCount;
             s.KillSwitchEnabled = _fw.AllProfilesBlockOutbound() && s.RuleCount > 0;
-            s.TunnelCarryingInternet =
-                AdapterService.IsTunnelCarryingInternet(config.TunnelInterfaceAliases);
+            s.TunnelCarryingInternet = IsVpnUp(config);
+
+            bool proxy = config.IsProxyMode;
+            string up = proxy ? "The proxy is up" : "VPN is up";
+            string down = proxy ? "The proxy is down" : "VPN is down";
 
             if (s.KillSwitchEnabled && s.TunnelCarryingInternet)
             {
                 s.Verdict = Verdict.Protected;
                 s.Headline = "PROTECTED";
-                s.Detail = "VPN is up and the kill switch is armed.";
+                s.Detail = up + " and the kill switch is armed.";
             }
             else if (s.KillSwitchEnabled)
             {
                 s.Verdict = Verdict.Blocked;
                 s.Headline = "BLOCKED";
-                s.Detail = "VPN is down and the kill switch is armed, so this PC has no internet. That is intended.";
+                s.Detail = down + " and the kill switch is armed, so this PC has no internet. That is intended.";
             }
             else if (s.TunnelCarryingInternet)
             {
                 s.Verdict = Verdict.AtRisk;
                 s.Headline = "AT RISK";
-                s.Detail = "VPN is up but the kill switch is OFF. Your traffic will leak if the VPN drops.";
+                s.Detail = up + " but the kill switch is OFF. Your traffic will leak if " +
+                           (proxy ? "an app ignores the proxy." : "the VPN drops.");
             }
             else
             {
                 s.Verdict = Verdict.Unprotected;
                 s.Headline = "UNPROTECTED";
-                s.Detail = "VPN is down and the kill switch is OFF.";
+                s.Detail = down + " and the kill switch is OFF.";
             }
             return s;
+        }
+
+        /// <summary>
+        /// Whether the VPN is currently carrying traffic.
+        ///
+        /// In tunnel mode this asks the routing table, because an adapter can sit
+        /// Up with a stale address long after the tunnel died - the exact case
+        /// that leaks.
+        ///
+        /// In proxy mode there is no route to inspect: every app's packets go to
+        /// loopback, and the core makes its own connection. The equivalent
+        /// question is whether the core is accepting on its port, which is what
+        /// an app would find if it tried right now.
+        /// </summary>
+        private static bool IsVpnUp(AppConfig config)
+        {
+            if (!config.IsProxyMode)
+            {
+                return AdapterService.IsTunnelCarryingInternet(config.TunnelInterfaceAliases);
+            }
+
+            // A TUN-mode client satisfies either test, so accept both rather than
+            // reporting it down while it is plainly working.
+            if (ProxyClientService.IsProxyListening(config.ProxyListenPort)) return true;
+            return AdapterService.IsTunnelCarryingInternet(config.TunnelInterfaceAliases);
         }
 
         // -------------------------------------------------------------- enable
@@ -107,11 +152,30 @@ namespace RestrictVpn
             Log.Info("=== Enabling kill switch ===");
 
             List<string> interfaces = config.AllAllowedInterfaces();
-            if (interfaces.Count == 0)
+
+            // Whichever mode is in force, refuse to arm without an allow-list.
+            // Default-deny with nothing permitted is not a kill switch, it is a
+            // machine with no internet and no way for the VPN to come back.
+            if (config.IsProxyMode)
+            {
+                List<string> live = config.ExistingClientPrograms();
+                if (live.Count == 0)
+                {
+                    throw new InvalidOperationException(
+                        "Proxy mode is selected but none of the configured VPN client programs exist " +
+                        "on disk. Arming now would block the proxy itself, so nothing was changed.\r\n\r\n" +
+                        "Press \"Detect client\" to find it, or check VpnClientPrograms in config.json.");
+                }
+                Log.Info("Proxy mode: " + live.Count + " program(s) may reach the network directly; " +
+                         "everything else must go through 127.0.0.1:" + config.ProxyListenPort + ".");
+            }
+            else if (interfaces.Count == 0)
             {
                 throw new InvalidOperationException(
                     "No tunnel adapters are selected. Arming now would block the VPN itself, " +
-                    "so nothing was changed.");
+                    "so nothing was changed.\r\n\r\n" +
+                    "If your VPN is a local proxy with no adapter of its own - V2rayN, Clash, " +
+                    "sing-box without TUN mode - switch the mode to Proxy instead.");
             }
 
             SavePolicySnapshot();
@@ -160,7 +224,10 @@ namespace RestrictVpn
             FwAction inbound = config.BlockInbound ? FwAction.Block : FwAction.Allow;
             _fw.SetAllProfileDefaults(true, inbound, FwAction.Block);
 
-            Log.Ok("Kill switch ENABLED. All outbound traffic now requires the VPN tunnel.");
+            Log.Ok(config.IsProxyMode
+                ? "Kill switch ENABLED. Only the VPN client may reach the network directly; " +
+                  "everything else must go through 127.0.0.1:" + config.ProxyListenPort + "."
+                : "Kill switch ENABLED. All outbound traffic now requires the VPN tunnel.");
         }
 
         private void BuildRules(AppConfig config, List<string> interfaces, List<RouteTarget> splitTargets)
@@ -168,30 +235,49 @@ namespace RestrictVpn
             string[] ifaces = interfaces.ToArray();
 
             // 1. The tunnel itself.
-            _fw.AddRule(RuleGroup, new RuleSpec
+            //
+            //    Only when there is something to scope to. A rule carrying an
+            //    empty interface list is not a narrow rule that matches nothing -
+            //    the firewall reads it as EVERY interface, which would turn the
+            //    first rule of the kill switch into a blanket permit. Proxy mode
+            //    legitimately has no adapter, so this has to be a condition here
+            //    rather than a check that fires after the fact.
+            if (ifaces.Length > 0)
             {
-                Name = Prefix + "Allow VPN Tunnel (outbound)",
-                Description = "Permit all outbound traffic that leaves through the VPN tunnel adapter(s).",
-                Direction = FwDirection.Outbound,
-                Action = FwAction.Allow,
-                Interfaces = ifaces
-            });
-            _fw.AddRule(RuleGroup, new RuleSpec
-            {
-                Name = Prefix + "Allow VPN Tunnel (inbound)",
-                Description = "Permit inbound traffic arriving on the VPN tunnel adapter(s).",
-                Direction = FwDirection.Inbound,
-                Action = FwAction.Allow,
-                Interfaces = ifaces
-            });
+                _fw.AddRule(RuleGroup, new RuleSpec
+                {
+                    Name = Prefix + "Allow VPN Tunnel (outbound)",
+                    Description = "Permit all outbound traffic that leaves through the VPN tunnel adapter(s).",
+                    Direction = FwDirection.Outbound,
+                    Action = FwAction.Allow,
+                    Interfaces = ifaces
+                });
+                _fw.AddRule(RuleGroup, new RuleSpec
+                {
+                    Name = Prefix + "Allow VPN Tunnel (inbound)",
+                    Description = "Permit inbound traffic arriving on the VPN tunnel adapter(s).",
+                    Direction = FwDirection.Inbound,
+                    Action = FwAction.Allow,
+                    Interfaces = ifaces
+                });
+            }
 
             // 2. The VPN client must still reach its server over the physical NIC,
             //    or the tunnel could never come back up after a drop.
+            //
+            //    In proxy mode these are not a supporting exception but the whole
+            //    allow-list: the core process is the only thing on the machine
+            //    with a path off the box, and every other app has to hand its
+            //    bytes to that process over loopback to get anywhere.
             string endpoints = null;
             if (config.VpnServerEndpoints.Count > 0)
             {
                 endpoints = string.Join(",", config.VpnServerEndpoints.ToArray());
             }
+
+            string clientPurpose = config.IsProxyMode
+                ? "Permit the VPN client to reach its server. In proxy mode this is the only permitted way out."
+                : "Permit the VPN client to reach the VPN server so the tunnel can be established.";
 
             foreach (string exe in config.VpnClientPrograms)
             {
@@ -203,7 +289,7 @@ namespace RestrictVpn
                 _fw.AddRule(RuleGroup, new RuleSpec
                 {
                     Name = Prefix + "Allow VPN client " + Path.GetFileName(exe),
-                    Description = "Permit the VPN client to reach the VPN server so the tunnel can be established.",
+                    Description = clientPurpose,
                     Direction = FwDirection.Outbound,
                     Action = FwAction.Allow,
                     ApplicationName = exe,
@@ -350,8 +436,11 @@ namespace RestrictVpn
                     {
                         Name = name,
                         Description = "Split tunnel exception for " + exe +
-                                      ". Permitted outside the tunnel; see the README for what an app " +
-                                      "exclusion can and cannot do.",
+                                      (config.IsProxyMode
+                                          ? ". In proxy mode this is a full bypass: the app may reach the " +
+                                            "internet directly instead of through the proxy."
+                                          : ". Permitted outside the tunnel; see the README for what an app " +
+                                            "exclusion can and cannot do."),
                         Direction = FwDirection.Outbound,
                         Action = FwAction.Allow,
                         ApplicationName = exe
@@ -390,8 +479,20 @@ namespace RestrictVpn
             }
             else if (config.SplitTunnelPrograms.Count > 0)
             {
-                Log.Info("Split tunnel: bypass proxy is off, so the " + config.SplitTunnelPrograms.Count +
-                         " app rule(s) permit traffic but do not move it off the tunnel.");
+                // The same rule means two different things depending on the mode,
+                // and saying the tunnel-mode thing in proxy mode would be exactly
+                // backwards. In tunnel mode the VPN owns the default route, so a
+                // permitted app still takes the tunnel and needs the bypass proxy
+                // to be moved off it. In proxy mode nothing has taken the default
+                // route away from the physical NIC - the proxy is a destination,
+                // not a path - so permitting an app is all it takes for that app
+                // to go direct.
+                Log.Info(config.IsProxyMode
+                    ? "Split tunnel: " + config.SplitTunnelPrograms.Count + " app rule(s) are a full bypass " +
+                      "in proxy mode - those apps reach the internet directly, with your real IP, and do " +
+                      "not need the bypass proxy to do it."
+                    : "Split tunnel: bypass proxy is off, so the " + config.SplitTunnelPrograms.Count +
+                      " app rule(s) permit traffic but do not move it off the tunnel.");
             }
         }
 
@@ -454,6 +555,19 @@ namespace RestrictVpn
             List<string> expected = config.AllAllowedInterfaces();
             List<RuleInfo> liveRules = _fw.GetRulesInGroup(RuleGroup);
 
+            if (config.IsProxyMode) VerifyProxyMode(config, liveRules, results);
+
+            // In proxy mode there is no tunnel adapter unless the client is in
+            // TUN mode, so the interface checks below only apply when adapters
+            // were actually ticked. Skipping them is safe: the proxy checks
+            // above are fatal in their place, so the arm path is never left
+            // without a preflight that can stop it.
+            if (config.IsProxyMode && expected.Count == 0)
+            {
+                if (config.SplitTunnelEnabled) VerifySplitTunnel(config, liveRules, results);
+                return results;
+            }
+
             RuleInfo tunnelRule = null;
             foreach (RuleInfo r in liveRules)
             {
@@ -505,6 +619,82 @@ namespace RestrictVpn
             if (config.SplitTunnelEnabled) VerifySplitTunnel(config, liveRules, results);
 
             return results;
+        }
+
+        /// <summary>
+        /// The proxy-mode counterpart of the interface checks: it is looking for
+        /// the same two failures, in the form they take when the allow-list is
+        /// made of processes rather than adapters.
+        ///
+        ///   - no client rule at all -> nothing may leave, and default-deny would
+        ///     strand the machine with no way for the proxy to reconnect.
+        ///   - a rule with no program on it -> the firewall reads a missing
+        ///     ApplicationName as EVERY program, which would quietly turn the
+        ///     kill switch into a permit-all. This is the one that fails open, so
+        ///     it is the more dangerous of the two and is checked explicitly.
+        /// </summary>
+        private void VerifyProxyMode(AppConfig config, List<RuleInfo> liveRules, List<CheckResult> results)
+        {
+            List<RuleInfo> clientRules = new List<RuleInfo>();
+            foreach (RuleInfo r in liveRules)
+            {
+                if (r.Name != null &&
+                    r.Name.StartsWith(Prefix + "Allow VPN client", StringComparison.OrdinalIgnoreCase))
+                {
+                    clientRules.Add(r);
+                }
+            }
+
+            results.Add(new CheckResult("Proxy mode: client allow rule exists", clientRules.Count > 0, true,
+                clientRules.Count > 0
+                    ? clientRules.Count + " rule(s) for the VPN client"
+                    : "No client rule found - nothing would be able to reach the network."));
+
+            if (clientRules.Count == 0) return;
+
+            int unscoped = 0;
+            foreach (RuleInfo r in clientRules)
+            {
+                if (string.IsNullOrEmpty(r.ApplicationName)) unscoped++;
+            }
+
+            results.Add(new CheckResult("Proxy mode: rules are scoped to a program", unscoped == 0, true,
+                unscoped == 0
+                    ? "Every client rule names an executable."
+                    : unscoped + " rule(s) came back with NO program, which the firewall treats as ALL programs."));
+
+            // Each configured program should have made it into a live rule. A
+            // missing one is not fatal - the others still carry the connection -
+            // but it is exactly how a client half-loses its network after an
+            // update moves an executable.
+            foreach (string exe in config.VpnClientPrograms)
+            {
+                if (!File.Exists(exe))
+                {
+                    results.Add(new CheckResult("VPN client present: " + Path.GetFileName(exe),
+                        false, false, "Not on disk: " + exe));
+                    continue;
+                }
+
+                bool bound = false;
+                foreach (RuleInfo r in clientRules)
+                {
+                    if (string.Equals(r.ApplicationName, exe, StringComparison.OrdinalIgnoreCase))
+                    {
+                        bound = true;
+                        break;
+                    }
+                }
+                results.Add(new CheckResult("Client rule bound: " + Path.GetFileName(exe), bound, false,
+                    bound ? exe : "No live rule names this executable - re-arm to rebuild it."));
+            }
+
+            results.Add(new CheckResult("Proxy mode: client is listening",
+                ProxyClientService.IsProxyListening(config.ProxyListenPort), false,
+                "127.0.0.1:" + config.ProxyListenPort +
+                (ProxyClientService.IsProxyListening(config.ProxyListenPort)
+                    ? " is accepting connections."
+                    : " is not accepting. Apps have no way out until the client is started.")));
         }
 
         /// <summary>
@@ -580,6 +770,10 @@ namespace RestrictVpn
             List<CheckResult> results = new List<CheckResult>();
             List<string> expected = config.AllAllowedInterfaces();
 
+            // Proxy mode rehearses the program-scoped rule instead, since that is
+            // the mechanism it will actually rely on.
+            if (config.IsProxyMode && expected.Count == 0) return SelfTestProxyMode(config);
+
             if (expected.Count == 0)
             {
                 results.Add(new CheckResult("Adapters selected", false, true,
@@ -634,6 +828,95 @@ namespace RestrictVpn
                     results.Add(new CheckResult("VPN client present: " + Path.GetFileName(exe),
                         File.Exists(exe), false, exe));
                 }
+            }
+            catch (Exception ex)
+            {
+                results.Add(new CheckResult("Self test", false, true, ex.Message));
+            }
+            finally
+            {
+                try { _fw.RemoveGroup(TestGroup); }
+                catch { }
+            }
+
+            return results;
+        }
+
+        /// <summary>
+        /// The proxy-mode rehearsal. Same shape as the interface one and the same
+        /// promise: a DISABLED probe rule is created, read back, and deleted, so
+        /// no live traffic is filtered either way.
+        ///
+        /// What it proves is that a rule scoped to an executable really binds to
+        /// that executable, since in proxy mode that binding is the whole kill
+        /// switch. It also reports whether the client is listening, which is not
+        /// a property of the firewall but is the first thing to check when
+        /// nothing can reach the internet after arming.
+        /// </summary>
+        private List<CheckResult> SelfTestProxyMode(AppConfig config)
+        {
+            List<CheckResult> results = new List<CheckResult>();
+            List<string> live = config.ExistingClientPrograms();
+
+            results.Add(new CheckResult("VPN client programs found", live.Count > 0, true,
+                live.Count > 0
+                    ? live.Count + " of " + config.VpnClientPrograms.Count + " configured program(s) exist on disk"
+                    : "None of the configured programs exist. Arming would leave nothing able to reach the network."));
+
+            if (live.Count == 0) return results;
+
+            string probeExe = live[0];
+
+            try
+            {
+                _fw.RemoveGroup(TestGroup);
+                _fw.AddRule(TestGroup, new RuleSpec
+                {
+                    Name = "RestrictVPN - Self test probe (disabled, safe to delete)",
+                    Description = "Temporary disabled rule used to verify program binding. Removed automatically.",
+                    Direction = FwDirection.Outbound,
+                    Action = FwAction.Allow,
+                    ApplicationName = probeExe,
+                    Enabled = false
+                });
+                results.Add(new CheckResult("Can create firewall rules", true, true,
+                    "Probe rule created (disabled, affects no traffic)."));
+
+                RuleInfo probe = null;
+                foreach (RuleInfo r in _fw.GetRulesInGroup(TestGroup)) { probe = r; break; }
+
+                if (probe == null)
+                {
+                    results.Add(new CheckResult("Probe rule readable", false, true,
+                        "The rule was created but could not be read back."));
+                    return results;
+                }
+
+                bool scoped = !string.IsNullOrEmpty(probe.ApplicationName);
+                results.Add(new CheckResult("Program scoping supported", scoped, true,
+                    scoped
+                        ? "Bound to: " + probe.ApplicationName
+                        : "Program came back EMPTY - the firewall would treat this as ALL programs."));
+
+                if (scoped)
+                {
+                    bool same = string.Equals(probe.ApplicationName, probeExe, StringComparison.OrdinalIgnoreCase);
+                    results.Add(new CheckResult("Binds to the right program", same, true,
+                        same ? "Confirmed" : "Read back as " + probe.ApplicationName + " instead of " + probeExe));
+                }
+
+                foreach (string exe in config.VpnClientPrograms)
+                {
+                    results.Add(new CheckResult("VPN client present: " + Path.GetFileName(exe),
+                        File.Exists(exe), false, exe));
+                }
+
+                bool listening = ProxyClientService.IsProxyListening(config.ProxyListenPort);
+                results.Add(new CheckResult("Client is listening", listening, false,
+                    "127.0.0.1:" + config.ProxyListenPort +
+                    (listening
+                        ? " is accepting connections."
+                        : " is not accepting. Start the VPN client before arming, or apps will have no way out.")));
             }
             catch (Exception ex)
             {

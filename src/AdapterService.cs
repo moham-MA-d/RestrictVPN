@@ -29,7 +29,15 @@ namespace RestrictVpn
             "OpenVPN Data Channel Offload",
             "OpenVPN",
             "WireGuard",
-            "TAP-Win32"
+            "TAP-Win32",
+            // The TUN adapters a local-proxy client raises when TUN mode is on.
+            // Most of them are Wintun underneath and are already caught above,
+            // but they are named here too so the ones that are not still show up.
+            "sing-box",
+            "singbox",
+            "Mihomo",
+            "Clash",
+            "v2rayN"
         };
 
         [DllImport("iphlpapi.dll", SetLastError = true)]

@@ -42,6 +42,10 @@ namespace RestrictVpn
         private Button _btnSplit;
         private Label _lblSplit;
         private CheckBox _chkBoot, _chkLan, _chkDhcp, _chkVpnDns, _chkInbound;
+        private RadioButton _rbTunnel, _rbProxy;
+        private Button _btnDetect;
+        private Label _lblProxy, _lblAdapterHint;
+        private bool _suppressModeEvent;
         private CheckedListBox _clbAdapters;
         private TextBox _txtLog;
         private NotifyIcon _notify;
@@ -84,7 +88,7 @@ namespace RestrictVpn
             // geometry below is honoured exactly, and the window stays resizable
             // with AutoScroll so nothing can become unreachable at any DPI.
             AutoScaleMode = AutoScaleMode.None;
-            ClientSize = new Size(880, 816);
+            ClientSize = new Size(880, 886);
             MinimumSize = new Size(700, 560);
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.Sizable;
@@ -155,18 +159,42 @@ namespace RestrictVpn
             _btnSplit.Click += OnSplitTunnelClick;
             Controls.Add(_btnSplit);
 
+            // --- mode ---
+            //
+            // Which of these is right is not a preference, it is a fact about the
+            // VPN: either it owns an adapter or it does not. Getting it wrong is
+            // the difference between a kill switch and no internet, so it is the
+            // first thing on the window rather than something buried in config.
+            Controls.Add(MakeHeader("How your VPN reaches the internet", 24, 250));
+
+            _rbTunnel = MakeRadio("It has a tunnel adapter  (OpenVPN, WireGuard)", 24, 276, 340);
+            _rbProxy = MakeRadio("It is a local proxy  (V2rayN, Clash, sing-box)", 372, 276, 330);
+            _rbTunnel.CheckedChanged += OnModeChanged;
+            _rbProxy.CheckedChanged += OnModeChanged;
+            Controls.AddRange(new Control[] { _rbTunnel, _rbProxy });
+
+            _btnDetect = MakeButton("Detect client", 716, 272, 140, 30, ColPanel);
+            _btnDetect.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            _btnDetect.Click += OnDetectClick;
+            Controls.Add(_btnDetect);
+
+            _lblProxy = MakeLabel("", 24, 304, 832, 22);
+            _lblProxy.ForeColor = ColMuted;
+            _lblProxy.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            Controls.Add(_lblProxy);
+
             // --- adapters ---
-            Controls.Add(MakeHeader("Tunnel adapters traffic may leave through", 24, 250));
-            Label hint = MakeLabel(
+            Controls.Add(MakeHeader("Tunnel adapters traffic may leave through", 24, 332));
+            _lblAdapterHint = MakeLabel(
                 "Tick every adapter your VPN uses. Anything not ticked is blocked while armed.    " +
                 "*  =  currently carrying your internet traffic",
-                24, 274, 830, 22);
-            hint.ForeColor = ColMuted;
-            Controls.Add(hint);
+                24, 356, 830, 22);
+            _lblAdapterHint.ForeColor = ColMuted;
+            Controls.Add(_lblAdapterHint);
 
             _clbAdapters = new CheckedListBox();
-            _clbAdapters.Location = new Point(24, 300);
-            _clbAdapters.Size = new Size(832, 150);
+            _clbAdapters.Location = new Point(24, 382);
+            _clbAdapters.Size = new Size(832, 140);
             _clbAdapters.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             _clbAdapters.BackColor = ColPanel;
             _clbAdapters.ForeColor = ColText;
@@ -177,29 +205,29 @@ namespace RestrictVpn
             Controls.Add(_clbAdapters);
 
             // --- options ---
-            Controls.Add(MakeHeader("Options", 24, 464));
+            Controls.Add(MakeHeader("Options", 24, 536));
 
-            _chkLan = MakeCheck("Allow local network (printers, NAS) - also reopens DNS to your router", 24, 488, 580);
-            _chkDhcp = MakeCheck("Allow DHCP - needed for Wi-Fi and Ethernet to get an address", 24, 516, 580);
-            _chkVpnDns = MakeCheck("Allow the VPN client to resolve its server hostname", 24, 544, 580);
-            _chkInbound = MakeCheck("Block inbound traffic as well", 24, 572, 580);
+            _chkLan = MakeCheck("Allow local network (printers, NAS) - also reopens DNS to your router", 24, 560, 580);
+            _chkDhcp = MakeCheck("Allow DHCP - needed for Wi-Fi and Ethernet to get an address", 24, 588, 580);
+            _chkVpnDns = MakeCheck("Allow the VPN client to resolve its server hostname", 24, 616, 580);
+            _chkInbound = MakeCheck("Block inbound traffic as well", 24, 644, 580);
             Controls.AddRange(new Control[] { _chkLan, _chkDhcp, _chkVpnDns, _chkInbound });
 
-            _btnSave = MakeButton("Save settings", 640, 506, 216, 40, ColAccent);
+            _btnSave = MakeButton("Save settings", 640, 578, 216, 40, ColAccent);
             _btnSave.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             _btnSave.Click += OnSaveClick;
             Controls.Add(_btnSave);
 
-            _lblSplit = MakeLabel("Split tunnel: off", 24, 602, 832, 22);
+            _lblSplit = MakeLabel("Split tunnel: off", 24, 674, 832, 22);
             _lblSplit.ForeColor = ColMuted;
             _lblSplit.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             Controls.Add(_lblSplit);
 
             // --- activity ---
-            Controls.Add(MakeHeader("Activity", 24, 630));
+            Controls.Add(MakeHeader("Activity", 24, 702));
 
             _txtLog = new TextBox();
-            _txtLog.Location = new Point(24, 654);
+            _txtLog.Location = new Point(24, 726);
             _txtLog.Size = new Size(832, 138);
             _txtLog.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
             _txtLog.Multiline = true;
@@ -312,6 +340,7 @@ namespace RestrictVpn
                 if (BypassProxy.IsRunning) split += "   |   " + BypassProxy.Status;
                 _lblSplit.Text = split;
                 _lblSplit.ForeColor = _config.SplitTunnelEnabled ? ColText : ColMuted;
+                RefreshProxyLabel();
 
                 if (_lastVerdict != s.Verdict)
                 {
@@ -385,14 +414,63 @@ namespace RestrictVpn
             _chkBoot.Checked = BootTask.IsInstalled();
             _suppressBootEvent = false;
 
+            _suppressModeEvent = true;
+            _rbProxy.Checked = _config.IsProxyMode;
+            _rbTunnel.Checked = !_config.IsProxyMode;
+            _suppressModeEvent = false;
+            ApplyModeToUi();
+
             ReloadAdapters();
 
+            Log.Info("Mode: " + (_config.IsProxyMode ? "proxy (no tunnel adapter)" : "tunnel adapter"));
             Log.Info("Split tunnel config: " + SplitTunnelService.DescribeConfig(_config));
-            AppendLog("VPN client programs allowed to reach the server: " + _config.VpnClientPrograms.Count);
+            AppendLog(_config.IsProxyMode
+                ? "Programs allowed to reach the network directly (everything else must use the proxy): "
+                  + _config.VpnClientPrograms.Count
+                : "VPN client programs allowed to reach the server: " + _config.VpnClientPrograms.Count);
             foreach (string p in _config.VpnClientPrograms)
             {
                 AppendLog("   " + Path.GetFileName(p) + (File.Exists(p) ? "" : "   (MISSING)"));
             }
+        }
+
+        /// <summary>
+        /// The adapter list stays visible and usable in proxy mode: a client with
+        /// TUN mode on has an adapter too, and ticking it there is both valid and
+        /// stricter. Only the wording changes, to say that ticking nothing is now
+        /// an ordinary state rather than a misconfiguration.
+        /// </summary>
+        private void ApplyModeToUi()
+        {
+            bool proxy = _config.IsProxyMode;
+
+            _lblAdapterHint.Text = proxy
+                ? "Only needed if your client runs in TUN mode. Leave all unticked for ordinary proxy mode.    " +
+                  "*  =  currently carrying your internet traffic"
+                : "Tick every adapter your VPN uses. Anything not ticked is blocked while armed.    " +
+                  "*  =  currently carrying your internet traffic";
+
+            RefreshProxyLabel();
+        }
+
+        private void RefreshProxyLabel()
+        {
+            if (!_config.IsProxyMode)
+            {
+                _lblProxy.Text = "Traffic is allowed out because of the adapter it leaves through.";
+                _lblProxy.ForeColor = ColMuted;
+                return;
+            }
+
+            int port = _config.ProxyListenPort;
+            bool listening = ProxyClientService.IsProxyListening(port);
+            int programs = _config.ExistingClientPrograms().Count;
+
+            _lblProxy.Text = string.Format(
+                "Only {0} program(s) may reach the network directly. Everything else must go through 127.0.0.1:{1} - {2}",
+                programs, port,
+                listening ? "accepting connections." : "NOT listening, so nothing can get out right now.");
+            _lblProxy.ForeColor = listening ? ColMuted : ColAmber;
         }
 
         private void ReloadAdapters()
@@ -446,11 +524,91 @@ namespace RestrictVpn
             }
 
             _config.TunnelInterfaceAliases = selected;
+            _config.Mode = _rbProxy.Checked ? AppConfig.ModeProxy : AppConfig.ModeTunnel;
             _config.AllowLan = _chkLan.Checked;
             _config.AllowDhcp = _chkDhcp.Checked;
             _config.AllowVpnClientDns = _chkVpnDns.Checked;
             _config.BlockInbound = _chkInbound.Checked;
             return _config;
+        }
+
+        private void OnModeChanged(object sender, EventArgs e)
+        {
+            // CheckedChanged fires twice per switch, once for each radio.
+            if (_suppressModeEvent || !((RadioButton)sender).Checked) return;
+
+            _config.Mode = _rbProxy.Checked ? AppConfig.ModeProxy : AppConfig.ModeTunnel;
+            ApplyModeToUi();
+
+            // Switching to proxy mode with nothing to allow would arm into a dead
+            // machine, so offer the detection right here rather than letting the
+            // preflight refuse later.
+            if (_config.IsProxyMode && _config.ExistingClientPrograms().Count == 0) OnDetectClick(sender, e);
+        }
+
+        /// <summary>
+        /// Finds the local-proxy client and folds it into the config. Detection
+        /// leads with the running process, so the usual case - the client is open
+        /// - needs no paths typed in at all.
+        /// </summary>
+        private void OnDetectClick(object sender, EventArgs e)
+        {
+            try
+            {
+                Cursor = Cursors.WaitCursor;
+
+                ProxyClientInfo info = ProxyClientService.Detect();
+                if (info == null)
+                {
+                    AppendLog("No local proxy client found.");
+                    MessageBox.Show(this,
+                        "No local proxy client was found.\r\n\r\n" +
+                        "Start V2rayN (or Clash, or sing-box) and press this again - detection finds a " +
+                        "running client wherever it is installed. Otherwise add its executables to " +
+                        "VpnClientPrograms in config.json by hand.",
+                        "RestrictVPN", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                bool changed = _config.AdoptProxyClient(info, true);
+                _config.Save();
+
+                Log.Ok("Detected " + info.Summary);
+                AppendLog("Detected " + info.Summary);
+                foreach (string p in info.Programs) AppendLog("   " + p);
+
+                _suppressModeEvent = true;
+                _rbProxy.Checked = _config.IsProxyMode;
+                _rbTunnel.Checked = !_config.IsProxyMode;
+                _suppressModeEvent = false;
+                ApplyModeToUi();
+                ReloadAdapters();
+
+                string tunNote = info.TunModeEnabled
+                    ? "\r\n\r\nThis client has TUN mode ON, so it does present an adapter. Tunnel mode " +
+                      "was kept and you should tick that adapter in the list - scoping to the adapter " +
+                      "is stricter than scoping to the process."
+                    : "\r\n\r\nThis client has no adapter of its own, so proxy mode is selected: while " +
+                      "armed, only these programs may reach the network and everything else has to go " +
+                      "through 127.0.0.1:" + info.ListenPort + ".";
+
+                MessageBox.Show(this,
+                    "Found " + info.Name + " at:\r\n" + info.BaseDir + "\r\n\r\n" +
+                    "Programs that will be allowed out:\r\n  - " +
+                    string.Join("\r\n  - ", info.Programs.ToArray()) + tunNote +
+                    (changed ? "\r\n\r\nSaved to config.json." : "\r\n\r\nAlready configured; nothing changed."),
+                    "RestrictVPN - Detect client", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                AppendLog("ERROR: " + ex.Message);
+                MessageBox.Show(this, ex.Message, "RestrictVPN", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                Cursor = Cursors.Default;
+                RefreshStatus(true);
+            }
         }
 
         // =====================================================================
@@ -479,20 +637,61 @@ namespace RestrictVpn
                 else
                 {
                     AppConfig cfg = ReadUiIntoConfig();
-                    if (cfg.TunnelInterfaceAliases.Count == 0)
+
+                    string list;
+                    if (cfg.IsProxyMode)
                     {
-                        MessageBox.Show(this,
-                            "Tick at least one tunnel adapter first.\r\n\r\nArming with none selected would " +
-                            "block the VPN itself, so nothing was changed.",
-                            "RestrictVPN", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                        return;
+                        List<string> live = cfg.ExistingClientPrograms();
+                        if (live.Count == 0)
+                        {
+                            MessageBox.Show(this,
+                                "No VPN client programs were found on disk.\r\n\r\nIn proxy mode those " +
+                                "programs are the only thing allowed out, so arming with none would " +
+                                "block the proxy itself. Nothing was changed.\r\n\r\n" +
+                                "Press \"Detect client\" to find them.",
+                                "RestrictVPN", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            return;
+                        }
+
+                        list = "  - " + string.Join("\r\n  - ", live.ToArray());
+                        foreach (string alias in cfg.TunnelInterfaceAliases) list += "\r\n  - adapter: " + alias;
+
+                        if (!ProxyClientService.IsProxyListening(cfg.ProxyListenPort) &&
+                            MessageBox.Show(this,
+                                "Nothing is listening on 127.0.0.1:" + cfg.ProxyListenPort + " right now, so " +
+                                "your VPN client does not look like it is running.\r\n\r\n" +
+                                "Arming anyway is safe - it fails closed, not open - but this PC will have " +
+                                "no internet at all until you start the client.\r\n\r\nArm anyway?",
+                                "RestrictVPN", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+                        {
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        if (cfg.TunnelInterfaceAliases.Count == 0)
+                        {
+                            MessageBox.Show(this,
+                                "Tick at least one tunnel adapter first.\r\n\r\nArming with none selected would " +
+                                "block the VPN itself, so nothing was changed.\r\n\r\n" +
+                                "If your VPN is a local proxy with no adapter of its own - V2rayN, Clash, " +
+                                "sing-box without TUN mode - choose \"It is a local proxy\" instead.",
+                                "RestrictVPN", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            return;
+                        }
+                        list = "  - " + string.Join("\r\n  - ", cfg.TunnelInterfaceAliases.ToArray());
                     }
 
-                    string list = "  - " + string.Join("\r\n  - ", cfg.TunnelInterfaceAliases.ToArray());
+                    string consequence = cfg.IsProxyMode
+                        ? "Every other program can only reach the internet by going through the proxy on " +
+                          "127.0.0.1:" + cfg.ProxyListenPort + ". If the client stops, they lose their " +
+                          "network path instead of falling back to your real IP. That is the point."
+                        : "If the VPN drops, this PC loses internet entirely. That is the point.";
+
                     if (MessageBox.Show(this,
                             "Arm the kill switch?\r\n\r\n" +
                             "Network traffic will only be allowed to leave through:\r\n" + list + "\r\n\r\n" +
-                            "If the VPN drops, this PC loses internet entirely. That is the point.\r\n\r\n" +
+                            consequence + "\r\n\r\n" +
                             "You can switch it off again whenever you like: this button becomes " +
                             "DISARM KILL SWITCH, and the tray icon has the same option. RestrictVPN " +
                             "edits your firewall locally, so disarming still works while the kill " +
@@ -961,6 +1160,17 @@ namespace RestrictVpn
             c.ForeColor = ColText;
             c.BackColor = Color.Transparent;
             return c;
+        }
+
+        private RadioButton MakeRadio(string text, int x, int y, int w)
+        {
+            RadioButton r = new RadioButton();
+            r.Text = text;
+            r.Location = new Point(x, y);
+            r.Size = new Size(w, 26);
+            r.ForeColor = ColText;
+            r.BackColor = Color.Transparent;
+            return r;
         }
     }
 }

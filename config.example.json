@@ -1,6 +1,9 @@
 {
   "_comment": "Reference copy of config.json. You do not need this file: RestrictVPN writes its own config.json next to the exe on first run, filling in the adapters and VPN client programs it finds on your machine. This is here to document the schema and show what a filled-in config looks like. Values below are examples - your adapter names and paths will differ.",
 
+  "_comment_mode": "'tunnel' = the VPN owns an adapter and that adapter is the only way out (OpenVPN, WireGuard, or any client in TUN mode). 'proxy' = the VPN is a local proxy with no adapter, so VpnClientPrograms is the only way out and every other app reaches it over loopback (V2rayN, Clash, sing-box with TUN mode off). Anything else, including a config written before this key existed, reads as 'tunnel'.",
+  "Mode": "tunnel",
+
   "TunnelInterfaceAliases": [
     "Local Area Connection",
     "OpenVPN Connect DCO Adapter"
@@ -16,6 +19,9 @@
   ],
   "VpnServerEndpoints": [],
   "AllowedPrograms": [],
+
+  "_comment_proxy": "The loopback port the proxy client listens on, read from the client's own settings by \"Detect client\". Used to report whether the client is live; it is not a firewall setting, because Windows does not filter loopback.",
+  "ProxyListenPort": 10808,
 
   "SplitTunnelEnabled": false,
   "SplitTunnelAddresses": [],
