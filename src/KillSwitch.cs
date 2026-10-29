@@ -151,7 +151,22 @@ namespace RestrictVpn
         {
             Log.Info("=== Enabling kill switch ===");
 
-            List<string> interfaces = config.AllAllowedInterfaces();
+            // Only adapters that exist may reach the firewall. A name with no
+            // adapter behind it must be filtered here and not one line later:
+            // INetFwRule.put_Interfaces resolves every entry, and an array with
+            // an unknown name kills the process in native code - no exception,
+            // no log, the window just vanishes. (Seen with a stale
+            // "Local Area Connection 4" in proxy mode.)
+            List<string> missingAdapters;
+            List<string> interfaces;
+            AdapterService.SplitExistingAliases(
+                config.AllAllowedInterfaces(), out interfaces, out missingAdapters);
+            if (missingAdapters.Count > 0)
+            {
+                Log.Warn("Skipping " + missingAdapters.Count + " adapter(s) that are not present: " +
+                         string.Join(", ", missingAdapters.ToArray()) +
+                         ". Untick them in the adapter list to stop seeing this.");
+            }
 
             // Whichever mode is in force, refuse to arm without an allow-list.
             // Default-deny with nothing permitted is not a kill switch, it is a
@@ -171,9 +186,12 @@ namespace RestrictVpn
             }
             else if (interfaces.Count == 0)
             {
+                string missing = missingAdapters.Count > 0
+                    ? "\r\n\r\nNot present right now: " + string.Join(", ", missingAdapters.ToArray())
+                    : "";
                 throw new InvalidOperationException(
                     "No tunnel adapters are selected. Arming now would block the VPN itself, " +
-                    "so nothing was changed.\r\n\r\n" +
+                    "so nothing was changed." + missing + "\r\n\r\n" +
                     "If your VPN is a local proxy with no adapter of its own - V2rayN, Clash, " +
                     "sing-box without TUN mode - switch the mode to Proxy instead.");
             }
@@ -552,10 +570,22 @@ namespace RestrictVpn
         public List<CheckResult> Verify(AppConfig config)
         {
             List<CheckResult> results = new List<CheckResult>();
-            List<string> expected = config.AllAllowedInterfaces();
+            // Fatal checks run against the adapters that exist: Enable arms with
+            // that same filtered list, so a "(not present)" entry must warn here,
+            // never fail the preflight for rules that were built correctly.
+            List<string> missing;
+            List<string> expected;
+            AdapterService.SplitExistingAliases(
+                config.AllAllowedInterfaces(), out expected, out missing);
             List<RuleInfo> liveRules = _fw.GetRulesInGroup(RuleGroup);
 
             if (config.IsProxyMode) VerifyProxyMode(config, liveRules, results);
+
+            foreach (string alias in missing)
+            {
+                results.Add(new CheckResult("Adapter present: " + alias, false, false,
+                    "Not present right now - skipped when arming. Untick it to stop seeing this."));
+            }
 
             // In proxy mode there is no tunnel adapter unless the client is in
             // TUN mode, so the interface checks below only apply when adapters
@@ -768,7 +798,13 @@ namespace RestrictVpn
         public List<CheckResult> SelfTest(AppConfig config)
         {
             List<CheckResult> results = new List<CheckResult>();
-            List<string> expected = config.AllAllowedInterfaces();
+            // The probe carries the same names the real rules would, so it gets
+            // the same filtering: a stale entry must never reach put_Interfaces,
+            // where it kills the process instead of failing the test.
+            List<string> missing;
+            List<string> expected;
+            AdapterService.SplitExistingAliases(
+                config.AllAllowedInterfaces(), out expected, out missing);
 
             // Proxy mode rehearses the program-scoped rule instead, since that is
             // the mechanism it will actually rely on.
@@ -776,9 +812,21 @@ namespace RestrictVpn
 
             if (expected.Count == 0)
             {
-                results.Add(new CheckResult("Adapters selected", false, true,
-                    "No tunnel adapters are ticked, so there is nothing to test."));
+                string detail = "No tunnel adapters are ticked, so there is nothing to test.";
+                if (missing.Count > 0)
+                {
+                    detail = "None of the ticked adapters are present right now (" +
+                             string.Join(", ", missing.ToArray()) +
+                             "). Reconnect the VPN or untick them.";
+                }
+                results.Add(new CheckResult("Adapters selected", false, true, detail));
                 return results;
+            }
+
+            foreach (string alias in missing)
+            {
+                results.Add(new CheckResult("Adapter present: " + alias, false, false,
+                    "Not present - skipped by the probe, and skipped when arming."));
             }
 
             try

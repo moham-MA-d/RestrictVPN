@@ -658,6 +658,10 @@ rest. [`config.example.json`](config.example.json) documents the schema.
   typically holds `0.0.0.0/1` and `128.0.0.0/1`, so any exclusion you can
   express already is. A VPN that installs a true `0.0.0.0/0` default route works
   too, for the same reason.
+- **Adapters shown as `(not present)` are skipped when arming.** A ticked
+  adapter that no longer exists is ignored with a warning rather than passed to
+  the firewall — and unticking it stops the warning. Arming with *only* missing
+  adapters is refused, since that would block the VPN itself.
 
 ---
 

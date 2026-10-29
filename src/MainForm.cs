@@ -639,6 +639,14 @@ namespace RestrictVpn
                     AppConfig cfg = ReadUiIntoConfig();
 
                     string list;
+                    // The dialog shows what arming will actually allow. Adapters
+                    // that are not present are skipped by the arm itself (asking
+                    // the firewall about them crashes it), so they are labelled,
+                    // not listed as paths out.
+                    List<string> missingAdapters;
+                    List<string> presentAdapters;
+                    AdapterService.SplitExistingAliases(
+                        cfg.TunnelInterfaceAliases, out presentAdapters, out missingAdapters);
                     if (cfg.IsProxyMode)
                     {
                         List<string> live = cfg.ExistingClientPrograms();
@@ -654,7 +662,8 @@ namespace RestrictVpn
                         }
 
                         list = "  - " + string.Join("\r\n  - ", live.ToArray());
-                        foreach (string alias in cfg.TunnelInterfaceAliases) list += "\r\n  - adapter: " + alias;
+                        foreach (string alias in presentAdapters) list += "\r\n  - adapter: " + alias;
+                        foreach (string alias in missingAdapters) list += "\r\n  - adapter: " + alias + "  (not present - skipped)";
 
                         if (!ProxyClientService.IsProxyListening(cfg.ProxyListenPort) &&
                             MessageBox.Show(this,
@@ -679,7 +688,8 @@ namespace RestrictVpn
                                 "RestrictVPN", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                             return;
                         }
-                        list = "  - " + string.Join("\r\n  - ", cfg.TunnelInterfaceAliases.ToArray());
+                        list = "  - " + string.Join("\r\n  - ", presentAdapters.ToArray());
+                        foreach (string alias in missingAdapters) list += "\r\n  - " + alias + "  (not present - skipped)";
                     }
 
                     string consequence = cfg.IsProxyMode

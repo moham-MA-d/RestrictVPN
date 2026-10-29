@@ -167,5 +167,54 @@ namespace RestrictVpn
             }
             return false;
         }
+
+        /// <summary>
+        /// Splits an allow-list into adapters that exist right now and ones that
+        /// do not.
+        ///
+        /// This must run before any alias reaches INetFwRule.put_Interfaces: that
+        /// setter resolves every name against the interface table, and an array
+        /// containing a name with no adapter behind it kills the process inside
+        /// native code - no managed exception, no log line, the window just
+        /// vanishes. A single unknown name returns catchable "Element not found",
+        /// but a mixed array does not come back at all. Filtering here keeps a
+        /// stale "(not present)" entry from turning ARM into a crash.
+        /// </summary>
+        public static void SplitExistingAliases(
+            IEnumerable<string> aliases, out List<string> existing, out List<string> missing)
+        {
+            existing = new List<string>();
+            missing = new List<string>();
+
+            List<string> present = new List<string>();
+            foreach (AdapterInfo a in GetAdapters())
+            {
+                if (!string.IsNullOrEmpty(a.Alias)) present.Add(a.Alias);
+            }
+
+            if (aliases == null) return;
+            foreach (string alias in aliases)
+            {
+                if (string.IsNullOrEmpty(alias)) continue;
+
+                bool found = false;
+                foreach (string name in present)
+                {
+                    if (string.Equals(name, alias, StringComparison.OrdinalIgnoreCase))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+
+                List<string> target = found ? existing : missing;
+                bool dup = false;
+                foreach (string s in target)
+                {
+                    if (string.Equals(s, alias, StringComparison.OrdinalIgnoreCase)) { dup = true; break; }
+                }
+                if (!dup) target.Add(alias);
+            }
+        }
     }
 }
